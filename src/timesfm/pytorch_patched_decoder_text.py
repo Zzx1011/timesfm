@@ -683,7 +683,7 @@ class PatchedTimeSeriesDecoder(nn.Module):
         self,
         input_ts: torch.Tensor,
         input_padding: torch.Tensor,
-        text_embedding: torch.Tensor | None = None  # 新增的文本嵌入
+        texts: list[str] | None = None  # 新增的文本嵌入
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -730,8 +730,8 @@ class PatchedTimeSeriesDecoder(nn.Module):
       if self.config.use_text_embedding:
         textEmbeddingModel = TextEmbedding(model_name="roberta-base")
 
-        texts = ["This is a time series."]
-
+        #texts = ["This is a time series."]
+        
         # text embedding
         embeddings = textEmbeddingModel(texts)
         text_emb = embeddings.to(model_input.device)
