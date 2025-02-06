@@ -1,7 +1,7 @@
 import pandas as pd
 
 # 读取CSV文件，假设文件名为input.csv，你需要根据实际文件名修改
-df = pd.read_csv('/home/zzx/projects/rrg-timsbc/zzx/News dataset/Facebook_Obama_transpose_final.csv')
+df = pd.read_csv('/home/zzx/projects/rrg-timsbc/zzx/timesfm/News dataset/Facebook_Obama_transpose_final.csv')
 
 # 使用第一列作为unique_id
 df['unique_id'] = df.iloc[:, 0]
@@ -15,4 +15,4 @@ df['ds'] = time_intervals
 
 # 选取unique_id和ds两列，并保存为新的CSV文件，文件名为output.csv，你可按需修改
 result_df = df[['unique_id', 'ds','target_value']]
-result_df.to_csv('/home/zzx/projects/rrg-timsbc/zzx/News dataset/Facebook_Obama_transpose_timesfm.csv', index=False)
+result_df.to_csv('/home/zzx/projects/rrg-timsbc/zzx/timesfm/News dataset/Facebook_Obama_transpose_timesfm.csv', index=False)
