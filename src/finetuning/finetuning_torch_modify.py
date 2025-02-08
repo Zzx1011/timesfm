@@ -173,12 +173,14 @@ class TimesFMFinetuner:
   def __init__(
       self,
       model: nn.Module,
+      MMTimesFM_model: nn.Module,
       config: FinetuningConfig,
       rank: int = 0,
       loss_fn: Optional[Callable] = None,
       logger: Optional[logging.Logger] = None,
   ):
     self.model = model
+    self.MMTimesFM_model = MMTimesFM_model
     self.config = config
     self.rank = rank
     self.logger = logger or logging.getLogger(__name__)
@@ -248,40 +250,72 @@ class TimesFMFinetuner:
     loss_second = -dev * (1.0 - quantile)
     return 2 * torch.where(loss_first >= 0, loss_first, loss_second)
 
-  def _process_batch(self, batch: List[torch.Tensor]) -> tuple:
-    """Process a single batch of data.
+  # def _process_batch(self, batch: List[torch.Tensor]) -> tuple:
+  #   """Process a single batch of data.
 
-        Args:
-          batch: List of input tensors.
+  #       Args:
+  #         batch: List of input tensors.
 
-        Returns:
-          Tuple of (loss, predictions).
-        """
-    x_context, x_padding, freq, x_future = [
-        t.to(self.device, non_blocking=True) for t in batch
-    ]
+  #       Returns:
+  #         Tuple of (loss, predictions).
+  #       """
+  #   x_context, x_padding, freq, x_future = [
+  #       t.to(self.device, non_blocking=True) for t in batch
+  #   ]
 
-    predictions = self.model(x_context, x_padding.float(), freq)
-    predictions_mean = predictions[..., 0]
-    last_patch_pred = predictions_mean[:, -1, :]
+  #   predictions = self.model(x_context, x_padding.float(), freq)
+  #   predictions_mean = predictions[..., 0]
+  #   last_patch_pred = predictions_mean[:, -1, :]
 
-    loss = self.loss_fn(last_patch_pred, x_future.squeeze(-1))
-    if self.config.use_quantile_loss:
-      quantiles = self.config.quantiles or create_quantiles()
-      for i, quantile in enumerate(quantiles):
-        last_patch_quantile = predictions[:, -1, :, i + 1]
-        loss += torch.mean(
-            self._quantile_loss(last_patch_quantile, x_future.squeeze(-1),
-                                quantile))
+  #   loss = self.loss_fn(last_patch_pred, x_future.squeeze(-1))
+  #   if self.config.use_quantile_loss:
+  #     quantiles = self.config.quantiles or create_quantiles()
+  #     for i, quantile in enumerate(quantiles):
+  #       last_patch_quantile = predictions[:, -1, :, i + 1]
+  #       loss += torch.mean(
+  #           self._quantile_loss(last_patch_quantile, x_future.squeeze(-1),
+  #                               quantile))
 
-    return loss, predictions
+  #   return loss, predictions
 
-  def _train_epoch(self, train_loader: DataLoader,
+  def _process_batch(self, batch: List[torch.Tensor], texts: List[str]) -> tuple:
+    """Process a batch for training MMTimesFM.
+
+    Args:
+        batch: List of input tensors.
+        texts: Corresponding text descriptions.
+
+    Returns:
+        Tuple of (loss, predictions).
+    """
+    x_context, x_padding, freq, x_future = [t.to(self.device, non_blocking=True) for t in batch]
+
+    # **Step 1: 使用 TimesFM 预测 x_{t+1}**
+    with torch.no_grad():
+        timesfm_pred = self.model(x_context, x_padding.float(), freq)
+        timesfm_pred_mean = timesfm_pred[..., 0]
+        x_t1_hat = timesfm_pred_mean[:, -1, :]  # 取最后时间步的预测值
+
+    # **Step 2: 计算 TimesFM 误差 δ(x_{t+1})**
+    delta_x_t1 = x_future.squeeze(-1) - x_t1_hat  # 真实值 - 预测值
+
+    # **Step 3: 让 MMTimesFM 预测该误差**
+    mm_timesfm_pred = self.MMTimesFM_model(x_context, x_padding.float(), freq, texts)
+    mm_timesfm_pred_mean = mm_timesfm_pred[..., 0]
+    delta_x_t1_hat = mm_timesfm_pred_mean[:, -1, :]  # MMTimesFM 预测误差
+
+    # **Step 4: 计算 MSE 损失**
+    loss = self.loss_fn(delta_x_t1_hat, delta_x_t1)
+
+    return loss, mm_timesfm_pred
+  
+  def _train_epoch(self, train_loader: DataLoader, train_texts: List[str],
                    optimizer: torch.optim.Optimizer) -> float:
     """Train for one epoch in a distributed setting.
 
         Args:
             train_loader: DataLoader for training data.
+            train_texts: List of text descriptions.
             optimizer: Optimizer instance.
 
         Returns:
@@ -291,8 +325,8 @@ class TimesFMFinetuner:
     total_loss = 0.0
     num_batches = len(train_loader)
 
-    for batch in train_loader:
-      loss, _ = self._process_batch(batch)
+    for i, batch in train_loader:
+      loss, _ = self._process_batch(batch, train_texts[i])
 
       optimizer.zero_grad()
       loss.backward()
@@ -309,11 +343,12 @@ class TimesFMFinetuner:
 
     return avg_loss
 
-  def _validate(self, val_loader: DataLoader) -> float:
+  def _validate(self, val_loader: DataLoader, val_texts: List[str],) -> float:
     """Perform validation.
 
         Args:
             val_loader: DataLoader for validation data.
+            val_texts: List of text descriptions.
 
         Returns:
             Average validation loss.
@@ -323,8 +358,8 @@ class TimesFMFinetuner:
     num_batches = len(val_loader)
 
     with torch.no_grad():
-      for batch in val_loader:
-        loss, _ = self._process_batch(batch)
+      for i, batch in val_loader:
+        loss, _ = self._process_batch(batch, val_texts[i])
         total_loss += loss.item()
 
     avg_loss = total_loss / num_batches
@@ -358,12 +393,14 @@ class TimesFMFinetuner:
             self.logger.warning(f"Checkpoint {ckpt_path} does not exist, skipping loading.")
 
   def finetune(self, train_dataset: Dataset,
-               val_dataset: Dataset, ckpt_path: Optional[str] = None) -> Dict[str, Any]:
+               val_dataset: Dataset, train_texts: Optional[List[str]] = None, val_texts: Optional[List[str]] = None, ckpt_path: Optional[str] = None) -> Dict[str, Any]:
     """Train the model.
 
         Args:
           train_dataset: Training dataset.
           val_dataset: Validation dataset.
+          train_texts: List of training texts.
+          val_texts: List of validation texts.
           ckpt_path: Path to a pre-trained checkpoint.
 
         Returns:
@@ -389,8 +426,8 @@ class TimesFMFinetuner:
 
     try:
       for epoch in range(self.config.num_epochs):
-        train_loss = self._train_epoch(train_loader, optimizer)
-        val_loss = self._validate(val_loader)
+        train_loss = self._train_epoch(train_loader, train_texts, optimizer)
+        val_loss = self._validate(val_loader, val_texts)
         current_lr = optimizer.param_groups[0]["lr"]
 
         metrics = {
