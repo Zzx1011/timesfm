@@ -3,11 +3,68 @@ import torch
 import torch.nn as nn
 from timesfm import timesfm_torch
 from timesfm import pytorch_patched_decoder as ppd  # 引入 PatchedTimeSeriesDecoder
+from timesfm.pytorch_patched_decoder import TimesFMDecoderLayer, causal_mask, merge_masks, convert_paddings_to_mask
+from typing import List, Tuple
 
-class MMTimesFm(ppd.PatchedTimeSeriesDecoder):
+class StackedDecoder(nn.Module):
+  """Stacked transformer layer."""
+
+  def __init__(
+      self,
+      hidden_size: int,
+      intermediate_size: int,
+      num_heads: int,
+      num_kv_heads: int,
+      head_dim: int,
+      num_layers: int,
+      rms_norm_eps: float = 1e-6,
+  ):
+    super().__init__()
+
+    self.layers = nn.ModuleList()
+    for _ in range(num_layers):
+      self.layers.append(
+          TimesFMDecoderLayer(
+              hidden_size=hidden_size,
+              intermediate_size=intermediate_size,
+              num_heads=num_heads,
+              num_kv_heads=num_kv_heads,
+              head_dim=head_dim,
+              rms_norm_eps=rms_norm_eps,
+          ))
+
+  def forward(
+      self,
+      hidden_states: torch.Tensor,
+      paddings: torch.Tensor,
+      kv_write_indices: torch.Tensor | None = None,
+      kv_caches: List[Tuple[torch.Tensor, torch.Tensor]] | None = None,
+  ) -> torch.Tensor:
+    padding_mask = convert_paddings_to_mask(paddings, hidden_states.dtype)
+    atten_mask = causal_mask(hidden_states)
+    
+    if torch.isnan(padding_mask).any() or torch.isinf(padding_mask).any():
+        print("Warning: NaN or Inf detected in padding_mask.")   
+    if torch.isnan(atten_mask).any() or torch.isinf(atten_mask).any():
+        print("Warning: NaN or Inf detected in atten_mask.")
+    mask = merge_masks(padding_mask, atten_mask)
+    for i in range(len(self.layers)):
+      layer = self.layers[i]
+      kv_cache = kv_caches[i] if kv_caches is not None else None
+      _, hidden_states = layer(
+          hidden_states=hidden_states,
+          mask=mask,
+          paddings=paddings,
+          kv_write_indices=kv_write_indices,
+          kv_cache=kv_cache,
+      )
+    return hidden_states
+  
+class MMTimesFM(ppd.PatchedTimeSeriesDecoder):
     def __init__(self, text_model_name="bert-base-uncased", **kwargs):
         super().__init__(**kwargs)
         
+        self.config = kwargs['config']
         # 1. 加载预训练的文本模型 (BERT)
         self.tokenizer = AutoTokenizer.from_pretrained(text_model_name)
         self.text_encoder = AutoModel.from_pretrained(text_model_name)
@@ -19,10 +76,22 @@ class MMTimesFm(ppd.PatchedTimeSeriesDecoder):
         self.cross_attention = nn.MultiheadAttention(embed_dim=self.config.hidden_size, num_heads=8, batch_first=True)
 
         # 4. 复用 TimesFM 的核心部分
-        self.decoder = ppd.PatchedTimeSeriesDecoder(self._model_config)
+        self.decoder = ppd.PatchedTimeSeriesDecoder(self.config)
+
+        self.stacked_transformer = StackedDecoder(
+        hidden_size=self.config.hidden_size,
+        intermediate_size=self.config.intermediate_size,
+        num_heads=self.config.num_heads,
+        num_kv_heads=self.config.num_kv_heads,
+        head_dim=self.config.head_dim,
+        num_layers=self.config.num_layers,
+        rms_norm_eps=self.config.rms_norm_eps,
+    )
 
     def encode_text(self, text_batch):
         """将文本转换为 text_embedding, 支持 batch 处理"""
+        if text_batch is None:
+            return None
         tokens = self.tokenizer(text_batch, return_tensors="pt", padding=True, truncation=True)
         with torch.no_grad():
             text_embedding = self.text_encoder(**tokens).last_hidden_state  # (batch, text_len, hidden_size)
@@ -40,6 +109,8 @@ class MMTimesFm(ppd.PatchedTimeSeriesDecoder):
         
         # 2. 计算 time_series_embedding
         model_input, patched_padding, stats, _ = self.decoder._preprocess_input(input_ts, input_padding)
+        print("patched_padding.shape: ",patched_padding.shape)
+        print("patched_padding: ",patched_padding)
 
         # 3. 用 Cross-Attention 融合文本特征
         if text_embedding is not None:
@@ -47,11 +118,17 @@ class MMTimesFm(ppd.PatchedTimeSeriesDecoder):
         else:
             fused_embedding = model_input
 
+        f_emb = self.freq_emb(freq)  # B x 1 x D
+        fused_embedding = fused_embedding + f_emb
+
         # 4. 传入 TimesFM 的核心部分 (PatchedTimeSeriesDecoder)
         model_output = self.decoder.stacked_transformer(fused_embedding, patched_padding)
+        print("model_output.shape",model_output.shape)
+        if torch.isnan(model_output).any() or torch.isinf(model_output).any():
+            print("Warning: NaN or Inf detected in model_output.")
 
         # 5. 还原输出
-        return self.decoder._postprocess_output(model_output, len(self._model_config.quantiles) + 1, stats)
+        return self.decoder._postprocess_output(model_output, len(self.config.quantiles) + 1, stats)
     
     def decode(self, input_ts, paddings, freq, horizon_len, output_patch_len=None, max_len=None, return_forecast_on_context=False, text=None):
         """支持文本输入的自回归解码过程"""

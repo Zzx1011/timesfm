@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
-from timesfm.pytorch_patched_decoder import create_quantiles
+# from timesfm.pytorch_patched_decoder import create_quantiles
 
 import wandb
 
@@ -228,11 +228,21 @@ class TimesFMFinetuner:
     else:
       sampler = None
 
+    def custom_collate_fn(batch):
+      # print(f"Batch shapes: {[x.shape for x in batch]}")  # 打印每个张量的形状
+      # print(f"Batch: {batch}")
+      x_context = torch.stack([item[0] for item in batch])
+      input_padding = torch.stack([item[1] for item in batch])
+      freq = torch.stack([item[2] for item in batch])
+      x_future = torch.stack([item[3] for item in batch])
+      return x_context, input_padding, freq, x_future
+  
     return DataLoader(
         dataset,
         batch_size=self.config.batch_size,
         shuffle=(is_train and not self.config.distributed),
         sampler=sampler,
+        collate_fn=custom_collate_fn,
     )
 
   def _quantile_loss(self, pred: torch.Tensor, actual: torch.Tensor,
@@ -278,7 +288,7 @@ class TimesFMFinetuner:
 
   #   return loss, predictions
 
-  def _process_batch(self, batch: List[torch.Tensor], texts: List[str]) -> tuple:
+  def _process_batch(self, batch: List[torch.Tensor], texts: Optional[str] = None) -> tuple:
     """Process a batch for training MMTimesFM.
 
     Args:
@@ -289,6 +299,9 @@ class TimesFMFinetuner:
         Tuple of (loss, predictions).
     """
     x_context, x_padding, freq, x_future = [t.to(self.device, non_blocking=True) for t in batch]
+    if texts is not None:
+        texts = texts.to(self.device, non_blocking=True)
+        print(f"Texts: {texts}")
 
     # **Step 1: 使用 TimesFM 预测 x_{t+1}**
     with torch.no_grad():
@@ -298,14 +311,17 @@ class TimesFMFinetuner:
 
     # **Step 2: 计算 TimesFM 误差 δ(x_{t+1})**
     delta_x_t1 = x_future.squeeze(-1) - x_t1_hat  # 真实值 - 预测值
+    print(f"Delta x_t1: {delta_x_t1}")
 
     # **Step 3: 让 MMTimesFM 预测该误差**
     mm_timesfm_pred = self.MMTimesFM_model(x_context, x_padding.float(), freq, texts)
     mm_timesfm_pred_mean = mm_timesfm_pred[..., 0]
     delta_x_t1_hat = mm_timesfm_pred_mean[:, -1, :]  # MMTimesFM 预测误差
+    print(f"Delta x_t1_hat: {delta_x_t1_hat}")
 
     # **Step 4: 计算 MSE 损失**
     loss = self.loss_fn(delta_x_t1_hat, delta_x_t1)
+    print(f"Loss: {loss}")
 
     return loss, mm_timesfm_pred
   
@@ -325,8 +341,11 @@ class TimesFMFinetuner:
     total_loss = 0.0
     num_batches = len(train_loader)
 
-    for i, batch in train_loader:
-      loss, _ = self._process_batch(batch, train_texts[i])
+    for i, batch in enumerate(train_loader):
+      if train_texts:
+        loss, _ = self._process_batch(batch, train_texts[i])
+      else:
+        loss, _ = self._process_batch(batch)
 
       optimizer.zero_grad()
       loss.backward()
@@ -358,7 +377,7 @@ class TimesFMFinetuner:
     num_batches = len(val_loader)
 
     with torch.no_grad():
-      for i, batch in val_loader:
+      for i, batch in enumerate(val_loader):
         loss, _ = self._process_batch(batch, val_texts[i])
         total_loss += loss.item()
 
@@ -407,9 +426,10 @@ class TimesFMFinetuner:
           Dictionary containing training history.
         """
     self.model = self.model.to(self.device)
-    # **加载 checkpoint**
-    if ckpt_path:
-        self._load_checkpoint(ckpt_path)
+    self.MMTimesFM_model = self.MMTimesFM_model.to(self.device)
+    # # **加载 checkpoint**
+    # if ckpt_path:
+    #     self._load_checkpoint(ckpt_path)
     train_loader = self._create_dataloader(train_dataset, is_train=True)
     val_loader = self._create_dataloader(val_dataset, is_train=False)
 
