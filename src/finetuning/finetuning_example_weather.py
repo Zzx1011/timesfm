@@ -370,6 +370,7 @@ def get_weather_dataset_data(context_len: int,
                             horizon_len: int,
                             freq_type: int = 0):
     time_series, texts = get_time_series_data('p (mbar)')
+    print(f"texts: {texts}")
     train_dataset, val_dataset, train_text, val_text = prepare_datasets(
           series=time_series,
           texts=texts,
@@ -377,14 +378,15 @@ def get_weather_dataset_data(context_len: int,
           horizon_length=horizon_len,
           freq_type=freq_type
       )
+    print("train_dataset: ",len(train_dataset))
     return train_dataset, val_dataset, train_text, val_text
 
 def single_gpu_example():
   """Basic example of finetuning TimesFM on stock data."""
   timesfm_model, mm_timesfm_model, hparams, tfm_config = get_models(load_timesfm_weights=True)
   config = FinetuningConfig(batch_size=256,
-                            num_epochs=2,  # 仅用 2 个 epoch 进行演示
-                            learning_rate=1e-5, # 降低学习率
+                            num_epochs=20,  # 仅用 2 个 epoch 进行演示
+                            learning_rate=1e-6, # 降低学习率
                             use_wandb=False,
                             freq_type=0,
                             log_every_n_steps=10,
@@ -399,7 +401,7 @@ def single_gpu_example():
                                                                 tfm_config.horizon_len,
                                                                 freq_type=config.freq_type)
   
-  finetuner = TimesFMFinetuner(model=timesfm_model, config=config,MMTimesFM_model=mm_timesfm_model)
+  finetuner = TimesFMFinetuner(model=timesfm_model, config=config, MMTimesFM_model=mm_timesfm_model)
 
   print("\nStarting finetuning MMTimesFM...")
   # for i in range(len(train_datasets)):
@@ -415,9 +417,9 @@ def single_gpu_example():
   print(f"Training history: {len(results['history']['train_loss'])} epochs")
 
   plot_predictions(
-      model=mm_timesfm_model,
+      model=timesfm_model,
       val_dataset=val_datasets,
-      save_path="mm_timesfm_predictions.png",
+      save_path="timesfm_predictions.png",
   )
 
 

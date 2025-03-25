@@ -1,9 +1,11 @@
 import json
+from re import S
 import time
 import pyarrow.parquet as pq
 import pandas as pd
 from datetime import datetime
 import torch
+from sklearn.preprocessing import StandardScaler
 
 def get_time_series_data(key):
     """
@@ -39,6 +41,12 @@ def get_time_series_data(key):
         # print(converted_time)
         news_texts = get_news_text_by_timestamp(converted_time)
         news_texts_list.append(news_texts)
+    # 对数据进行归一化
+    scaler = StandardScaler()
+    time_series_data = time_series_data.reshape(-1, 1)
+    scaler.fit(time_series_data)
+    time_series_data = scaler.transform(time_series_data)
+    time_series_data = time_series_data.flatten()
     return time_series_data, news_texts_list
 
 

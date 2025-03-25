@@ -12,8 +12,11 @@ import os
 from os import path
 from typing import Optional, Tuple
 
+from jax import config
 import numpy as np
 import pandas as pd
+from regex import F
+from sympy import true
 import torch
 import torch.multiprocessing as mp
 import yfinance as yf
@@ -21,10 +24,15 @@ from absl import app, flags
 from huggingface_hub import snapshot_download
 from torch.utils.data import Dataset
 
-from finetuning.finetuning_torch_modify import FinetuningConfig, TimesFMFinetuner
+from finetuning_torch_modify import FinetuningConfig, TimesFMFinetuner
 from timesfm import TimesFm, TimesFmCheckpoint, TimesFmHparams
+from timesfm.timesfm_torch import TimesFmTorch
 from timesfm.pytorch_patched_decoder import PatchedTimeSeriesDecoder
-import MMtimesFM
+from MMtimesFM_model import MMTimesFM
+import traceback
+from timesfm import pytorch_patched_decoder as ppd
+import dataclasses
+from typing import List, Tuple
 
 FLAGS = flags.FLAGS
 
@@ -71,12 +79,16 @@ class TimeSeriesDataset(Dataset):
     """Prepare sliding window samples from the time series."""
     self.samples = []
     total_length = self.context_length + self.horizon_length
+    print(self.context_length, self.horizon_length)  # 调试输出
+    print(f"Series length: {len(self.series)}, Required length: {total_length}")  # 调试输出
 
     for start_idx in range(0, len(self.series) - total_length + 1):
       end_idx = start_idx + self.context_length
       x_context = self.series[start_idx:end_idx]
       x_future = self.series[end_idx:end_idx + self.horizon_length]
       self.samples.append((x_context, x_future))
+
+    print(f"Generated samples: {len(self.samples)}")  # 调试输出
 
   def __len__(self) -> int:
     return len(self.samples)
@@ -110,14 +122,25 @@ def prepare_datasets(series: np.ndarray, texts: list, context_length: int, horiz
     Returns:
         Tuple of (train_dataset, val_dataset, train_texts, val_texts)
     """
-    num_samples = series.shape[0]  # 文章数量
-    train_size = int(num_samples * train_split)
+    num_timesteps = len(series)  # 时间步数
+    train_size = int(num_timesteps * train_split)
 
     train_data, val_data = series[:train_size], series[train_size:]
     train_texts, val_texts = texts[:train_size], texts[train_size:]
+    # print(
+    #     f"Training data: {len(train_data)} samples, Validation data: {len(val_data)} samples"
+    # )
 
-    train_dataset = [TimeSeriesDataset(ts, context_length, horizon_length, freq_type) for ts in train_data]
-    val_dataset = [TimeSeriesDataset(ts, context_length, horizon_length, freq_type) for ts in val_data]
+      # Create datasets with specified frequency type
+    train_dataset = TimeSeriesDataset(train_data,
+                                      context_length=context_length,
+                                      horizon_length=horizon_length,
+                                      freq_type=freq_type)
+    
+    val_dataset = TimeSeriesDataset(val_data,
+                                    context_length=context_length,
+                                    horizon_length=horizon_length,
+                                    freq_type=freq_type)
 
     return train_dataset, val_dataset, train_texts, val_texts
 
@@ -132,22 +155,48 @@ def get_models(load_timesfm_weights: bool = False):
     hparams = TimesFmHparams(
         backend=device,
         per_core_batch_size=32,
-        horizon_len=128,
+        horizon_len=16,  # 预测未来 16 个时间步
         num_layers=50,
         use_positional_embedding=False,
         context_len=192,
     )
-    timesfm = TimesFm(hparams=hparams, checkpoint=TimesFmCheckpoint(path=path))
+    timesfm = TimesFmTorch(hparams=hparams, checkpoint=TimesFmCheckpoint(path=checkpoint_path))
 
-    timesfm_model = PatchedTimeSeriesDecoder(timesfm._model_config)
+    def _create_quantiles() -> list[float]:
+      return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    model_config = ppd.TimesFMConfig(
+        num_layers=20,
+        num_heads=16,
+        hidden_size=1280,
+        intermediate_size=1280,
+        patch_len=32,
+        horizon_len=128, #这个值要改
+        head_dim=1280 // 16,
+        quantiles = _create_quantiles(),
+        use_positional_embedding=True,
+    )
+
+    # timesfm_model = PatchedTimeSeriesDecoder(timesfm._model_config)
+    timesfm_model = PatchedTimeSeriesDecoder(model_config)
     if load_timesfm_weights:
         # checkpoint_path = path.join(snapshot_download(repo_id), "torch_model.ckpt")
+        print(f"Loading TimesFM weights from: {checkpoint_path}")
         loaded_checkpoint = torch.load(checkpoint_path, weights_only=True)
-        timesfm_model.load_state_dict(loaded_checkpoint)
+        print(f"Loaded TimesFM weights from: {checkpoint_path}")
+
+        # 获取模型当前的状态字典
+        model_state_dict = timesfm_model.state_dict()
+        # 过滤掉意外的键
+        pretrained_dict = {k: v for k, v in loaded_checkpoint.items() if k in model_state_dict}
+        # 更新模型的状态字典
+        model_state_dict.update(pretrained_dict)
+        # 加载过滤后的状态字典
+        timesfm_model.load_state_dict(model_state_dict)
+        # timesfm_model.load_state_dict(loaded_checkpoint)
     timesfm_model.eval()  # TimesFM 不训练，只做推理
 
     # 初始化 MMTimesFM（用户训练）
-    mm_timesfm_model = MMtimesFM()  # MMTimesFM 结构类似 TimesFM
+    mm_timesfm_model = MMTimesFM(config=timesfm._model_config)  # MMTimesFM 结构类似 TimesFM
     mm_timesfm_model.train()  # MMTimesFM 需要训练
 
     return timesfm_model, mm_timesfm_model, hparams, timesfm._model_config
@@ -260,12 +309,12 @@ def get_news_dataset_data(context_len: int, horizon_len: int, freq_type: int = 0
         freq_type: Frequency type (0, 1, or 2)
 
     Returns:
-        Tuple of (train_dataset, val_dataset, train_texts, val_texts)
+        Tuple of (train_datasets, val_datasets, train_texts, val_texts)
     """
     # 读取时间序列数据
     ts_file = "/home/zzx/projects/rrg-timsbc/zzx/timesfm/News dataset/Facebook_Obama_transpose_final.csv"
     ts_df = pd.read_csv(ts_file, index_col=0)  # IDLink 作为索引
-    ts_df = ts_df.T  # 转置，使行表示新闻，列表示时间步
+    # ts_df = ts_df.T  # 转置，使行表示新闻，列表示时间步
     ts_data = ts_df.values  # 转换为 NumPy 数组
 
     # 读取文本数据
@@ -285,30 +334,41 @@ def get_news_dataset_data(context_len: int, horizon_len: int, freq_type: int = 0
     texts = txt_df["text"].tolist()  # 提取文本数据
 
     # 构建训练和验证集
-    train_dataset, val_dataset, train_texts, val_texts = prepare_datasets(
-        series=ts_data,
-        texts=texts,
-        context_length=context_len,
-        horizon_length=horizon_len,
-        freq_type=freq_type
-    )
+    train_datasets = []
+    val_datasets = []
+    train_texts = []
+    val_texts = []
+    for i in range(ts_data.shape[1]):
+      train_dataset, val_dataset, train_text, val_text = prepare_datasets(
+          series=ts_data[:, i].reshape(-1, 1),
+          texts=texts,
+          context_length=context_len,
+          horizon_length=horizon_len,
+          freq_type=freq_type
+      )
+      # print(f"train_dataset: {len(train_dataset)}")
+    
+      train_datasets.append(train_dataset)
+      val_datasets.append(val_dataset)
+      train_texts.append(train_text)
+      val_texts.append(val_text)
 
-    print(f"Created datasets:")
-    print(f"- Training samples: {len(train_dataset)}")
-    print(f"- Validation samples: {len(val_dataset)}")
-    print(f"- Using frequency type: {freq_type}")
+    # print(f"Created datasets:")
+    # print(f"- Training samples: {len(train_dataset)}")
+    # print(f"- Validation samples: {len(val_dataset)}")
+    # print(f"- Using frequency type: {freq_type}")
 
-    return train_dataset, val_dataset, train_texts, val_texts
+    return train_datasets, val_datasets, train_texts, val_texts
 
 
 def single_gpu_example():
   """Basic example of finetuning TimesFM on stock data."""
-  timesfm_model, mm_timesfm_model, hparams, tfm_config = get_models(load_weights=True)
+  timesfm_model, mm_timesfm_model, hparams, tfm_config = get_models(load_timesfm_weights=True)
   config = FinetuningConfig(batch_size=256,
                             num_epochs=5,
                             learning_rate=1e-4,
-                            use_wandb=True,
-                            freq_type=1,
+                            use_wandb=False,
+                            freq_type=0,
                             log_every_n_steps=10,
                             val_check_interval=0.5,
                             use_quantile_loss=True)
@@ -317,17 +377,21 @@ def single_gpu_example():
   #                                       tfm_config.horizon_len,
   #                                       freq_type=config.freq_type)
   
-  train_dataset, val_dataset, train_texts, val_texts = get_news_dataset_data(128,
+  train_datasets, val_datasets, train_texts, val_texts = get_news_dataset_data(32,
                                                                 tfm_config.horizon_len,
                                                                 freq_type=config.freq_type)
   
   finetuner = TimesFMFinetuner(model=timesfm_model, config=config,MMTimesFM_model=mm_timesfm_model)
 
   print("\nStarting finetuning MMTimesFM...")
-  results = finetuner.finetune(train_dataset=train_dataset,
-                               val_dataset=val_dataset,
-                               train_texts=train_texts,
-                               val_texts=val_texts)
+  for i in range(len(train_datasets)):
+    print(f"Finetuning model for news article {i + 1}/{len(train_datasets)}")
+    train_dataset = train_datasets[i]
+    val_dataset = val_datasets[i]
+    results = finetuner.finetune(train_dataset=train_dataset,
+                                val_dataset=val_dataset,
+                                train_texts=train_texts,
+                                val_texts=val_texts)
 
   print("\nFinetuning completed!")
   print(f"Training history: {len(results['history']['train_loss'])} epochs")
@@ -390,14 +454,14 @@ def multi_gpu_example():
       batch_size=256,
       num_epochs=5,
       learning_rate=3e-5,
-      use_wandb=True,
+      use_wandb=False,
       distributed=True,
       gpu_ids=gpu_ids,
       log_every_n_steps=50,
       val_check_interval=0.5,
   )
   # train_dataset, val_dataset = get_data(128, tfm_config.horizon_len)
-  train_dataset, val_dataset, train_texts, val_texts = get_news_dataset_data(128,
+  train_dataset, val_dataset, train_texts, val_texts = get_news_dataset_data(32,
                                                                 tfm_config.horizon_len,
                                                                 freq_type=config.freq_type)
   
@@ -432,7 +496,7 @@ def main(argv):
           batch_size=256,
           num_epochs=5,
           learning_rate=3e-5,
-          use_wandb=True,
+          use_wandb=False,
           distributed=True,
           gpu_ids=gpu_ids,
       )
@@ -442,6 +506,7 @@ def main(argv):
 
   except Exception as e:
     print(f"Training failed: {str(e)}")
+    traceback.print_exc()
   finally:
     if torch.distributed.is_initialized():
       torch.distributed.destroy_process_group()

@@ -288,7 +288,7 @@ class TimesFMFinetuner:
 
   #   return loss, predictions
 
-  def _process_batch(self, batch: List[torch.Tensor], texts: Optional[str] = None) -> tuple:
+  def _process_batch(self, batch: List[torch.Tensor], texts: List[Optional[List[str]]]) -> tuple:
     """Process a batch for training MMTimesFM.
 
     Args:
@@ -299,22 +299,23 @@ class TimesFMFinetuner:
         Tuple of (loss, predictions).
     """
     x_context, x_padding, freq, x_future = [t.to(self.device, non_blocking=True) for t in batch]
-    if texts is not None:
-        texts = texts.to(self.device, non_blocking=True)
-        print(f"Texts: {texts}")
+    
 
     # **Step 1: 使用 TimesFM 预测 x_{t+1}**
     with torch.no_grad():
         timesfm_pred = self.model(x_context, x_padding.float(), freq)
         timesfm_pred_mean = timesfm_pred[..., 0]
         x_t1_hat = timesfm_pred_mean[:, -1, :]  # 取最后时间步的预测值
-
+        print(f"x_t1_hat: {x_t1_hat}")
     # **Step 2: 计算 TimesFM 误差 δ(x_{t+1})**
     delta_x_t1 = x_future.squeeze(-1) - x_t1_hat  # 真实值 - 预测值
     print(f"Delta x_t1: {delta_x_t1}")
 
     # **Step 3: 让 MMTimesFM 预测该误差**
-    mm_timesfm_pred = self.MMTimesFM_model(x_context, x_padding.float(), freq, texts)
+    if texts is not None:
+        # texts = texts.to(self.device, non_blocking=True)
+        print(f"Texts: {texts}")
+    mm_timesfm_pred = self.MMTimesFM_model.forward(x_context, x_padding.float(), freq, texts)
     mm_timesfm_pred_mean = mm_timesfm_pred[..., 0]
     delta_x_t1_hat = mm_timesfm_pred_mean[:, -1, :]  # MMTimesFM 预测误差
     print(f"Delta x_t1_hat: {delta_x_t1_hat}")
@@ -337,18 +338,31 @@ class TimesFMFinetuner:
         Returns:
             Average training loss for the epoch.
         """
-    self.model.train()
+    self.MMTimesFM_model.train()
     total_loss = 0.0
     num_batches = len(train_loader)
+    # print("train_texts: ",train_texts)
+    # print("train_texts len: ",len(train_texts))
 
-    for i, batch in enumerate(train_loader):
+    train_texts = [t if t is not None else [] for t in train_texts]
+    while len(train_texts) < len(train_loader):
+      train_texts.append([])  # 用空文本填充
+    text_batch_start = 0
+    for i, (batch) in enumerate(train_loader):
+      text_batch = train_texts[text_batch_start:text_batch_start + len(batch)] 
+      text_batch_start += len(batch)
+      print(f"[DEBUG] Batch {i}: batch size = {len(batch)}, text batch size = {len(text_batch)}")
+      print(f"[DEBUG] Batch {i}: batch = {batch}, text batch = {text_batch}")
       if train_texts:
-        loss, _ = self._process_batch(batch, train_texts[i])
+        loss, _ = self._process_batch(batch, text_batch)
       else:
         loss, _ = self._process_batch(batch)
 
       optimizer.zero_grad()
       loss.backward()
+
+      # Apply gradient clipping before the optimizer step
+      torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
       optimizer.step()
 
       total_loss += loss.item()
@@ -378,7 +392,10 @@ class TimesFMFinetuner:
 
     with torch.no_grad():
       for i, batch in enumerate(val_loader):
-        loss, _ = self._process_batch(batch, val_texts[i])
+        if val_texts:
+          loss, _ = self._process_batch(batch, val_texts[i])
+        else:
+          loss, _ = self._process_batch(batch)
         total_loss += loss.item()
 
     avg_loss = total_loss / num_batches
@@ -433,9 +450,10 @@ class TimesFMFinetuner:
     train_loader = self._create_dataloader(train_dataset, is_train=True)
     val_loader = self._create_dataloader(val_dataset, is_train=False)
 
-    optimizer = torch.optim.Adam(self.model.parameters(),
-                                 lr=self.config.learning_rate,
-                                 weight_decay=self.config.weight_decay)
+    # optimizer = torch.optim.Adam(self.model.parameters(),
+    #                              lr=self.config.learning_rate,
+    #                              weight_decay=self.config.weight_decay)
+    optimizer = torch.optim.SGD(self.model.parameters(), lr=self.config.learning_rate, momentum=0.9)
 
     history = {"train_loss": [], "val_loss": [], "learning_rate": []}
 

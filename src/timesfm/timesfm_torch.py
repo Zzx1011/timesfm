@@ -37,7 +37,8 @@ class TimesFmTorch(timesfm_base.TimesFmBase):
         hidden_size=self.model_dims,
         intermediate_size=self.model_dims,
         patch_len=self.input_patch_len,
-        horizon_len=self.output_patch_len,
+        # horizon_len=self.output_patch_len,
+        horizon_len=16,
         head_dim=self.model_dims // self.num_heads,
         quantiles=self.quantiles,
         use_positional_embedding=self.use_pos_emb,
@@ -45,8 +46,11 @@ class TimesFmTorch(timesfm_base.TimesFmBase):
     self._model = None
     self.num_cores = 1
     self.global_batch_size = self.per_core_batch_size
+    self.backend = "gpu"
+    # self._device = torch.device("cuda:0" if (
+    #     torch.cuda.is_available() and self.backend == "gpu") else "cpu")
     self._device = torch.device("cuda:0" if (
-        torch.cuda.is_available() and self.backend == "gpu") else "cpu")
+        torch.cuda.is_available() ) else "cpu")
     self._median_index = -1
 
   def load_from_checkpoint(
